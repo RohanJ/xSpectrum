@@ -1,0 +1,323 @@
+//
+//  xSpectrumCocoaView.mm
+//  xSpectrum
+//
+//  Created by Rohan Jyoti on 04/20/13.
+//  Copyright (c) 2013 Rohan Jyoti. All rights reserved.
+//
+
+#import "xSpectrumCocoaView.h"
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::EventListenerDispatcher  *
+ * @parameters:     void*, void*, const AudioUnitEvent,          *
+ *                  UInt64, Float32                              *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        Callback dispacther invoked by Audio Unit    *
+ *                  Service Host                                 *
+ ****************************************************************/
+
+#pragma mark ____ LISTENER CALLBACK DISPATCHER ____
+// This listener responds to parameter changes, gestures, and property notifications
+void EventListenerDispatcher (void *inRefCon, 
+							  void *inObject, 
+							  const AudioUnitEvent *inEvent, 
+							  UInt64 inHostTime, 
+							  Float32 inValue)
+{
+	xSpectrumCocoaView *SELF = (xSpectrumCocoaView *)inRefCon;
+	[SELF priv_eventListener:inObject event: inEvent value: inValue];
+}
+
+
+
+@implementation xSpectrumCocoaView
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::dealloc                  *
+ * @parameters:     void*, void*, const AudioUnitEvent,          *
+ *                  UInt64, Float32                              *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        Callback dispacther invoked by Audio Unit    *
+ *                  Service Host                                 *
+ ****************************************************************/
+
+#pragma mark ____ (INIT /) DEALLOC ____
+- (void)dealloc 
+{
+	[self priv_removeListeners];
+	
+	if (mData) 
+	{
+		free(mData);	
+		mData = NULL;
+	}
+	[super dealloc];
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::removeFromSuperview      *
+ * @parameters:     none                                         *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        For refreshing GUI elements                  *
+ ****************************************************************/
+
+- (void) removeFromSuperview
+{
+	[mFetchTimer invalidate];
+	
+	[super removeFromSuperview];
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::timer                    *
+ * @parameters:     none                                         *
+ * @return:         NSTimer*                                     *
+ * @type:           public                                       *
+ * @purpose:        For getting current timeStamp                *
+ ****************************************************************/
+
+#pragma mark ___OnTimer___
+- (NSTimer *) timer 
+{
+	return [[mFetchTimer retain] autorelease];
+}
+
+- (void) setTimer: (NSTimer *) value 
+{
+	if ( mFetchTimer != value ) 
+	{
+		[mFetchTimer release];
+		mFetchTimer = [value retain];
+	}
+}
+
+#pragma mark ____ PUBLIC FUNCTIONS ____
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::setAU                    *
+ * @parameters:     AudioUnit                                    *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        Lets the AUHS integrate said plugin          *
+ ****************************************************************/
+
+- (void)setAU:(AudioUnit)inAU 
+{
+	[self priv_initBuffers];
+	
+	// Here we attempt to remove any previous listeners
+	if (mAU) [self priv_removeListeners];	
+	mAU = inAU;
+	
+	// next, we will add new listeners
+	[self priv_addListeners];
+	
+	// initial AU client listener setup
+	[self priv_synchronizeUIWithParameterValues];
+	
+	// register for resize notification and data changes
+	//[[NSNotificationCenter defaultCenter]
+	// addObserver: self selector: @selector(handleSpectrumSizeChanged:) name: NSViewFrameDidChangeNotification  object: uixSpectrumView];
+	
+	[self setTimer: [NSTimer scheduledTimerWithTimeInterval: (1.0/60.0) //60Hz
+													 target: self
+												   selector: @selector(updateSpectrum:)
+												   userInfo: nil
+													repeats: YES]];	
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::updateSpectrum           *
+ * @parameters:     NSTimer*                                     *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        For refreshing actual spectrum               *
+ ****************************************************************/
+
+#pragma mark ___Drawing___
+
+- (void) updateSpectrum: (NSTimer*) time
+{	
+	if ([uixSpectrumView storing]) return; //refer to xSpectrumView.h for details
+	
+	//Retrieve component to send to ui
+	mData->mChannel = 0;
+	Float64 tStamp;
+	UInt32 size = sizeof(Float64);
+	ComponentResult result = AudioUnitGetProperty(mAU,
+												  kAudioUnitProperty_SampleTimeStamp,
+												  kAudioUnitScope_Global,
+												  0,
+												  &tStamp,
+												  &size);
+	
+	//determine number of slices to process within given timeframe (60hz)
+	SInt64 numToGet = (SInt64) (tStamp - mData->mFetchStamp.mSampleTime);
+	
+	if(numToGet == 0) return;
+	
+	if(numToGet > kMaxNumAnalysisFrames) 
+		numToGet = kMaxNumAnalysisFrames;
+	
+	mData->mNumSlices = numToGet; 
+	
+	size = sizeof(xSpectrumData);
+	result = AudioUnitGetProperty(mAU,
+								  kAudioUnitProperty_xSpectrumData,
+								  kAudioUnitScope_Global,
+								  0,
+								  mData,
+								  &size);	
+	
+	if (result == noErr && tStamp != 0)
+		[uixSpectrumView storeSlices: mData];	
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::handleSpectrumSizeChanged*
+ * @parameters:     NSNotification *                             *
+ * @return:         none                                         *
+ * @type:           public                                       *
+ * @purpose:        As of now, this function does not            *
+ *                  accommodate changes in spectrum size         *
+ ****************************************************************/
+
+#pragma mark ____ INTERFACE ACTIONS ____
+- (void) handleSpectrumSizeChanged:(NSNotification *) aNotification 
+{
+	[self updateSpectrum: nil];
+}
+
+
+#pragma mark ____ PRIVATE FUNCTIONS ____
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::priv_initBuffers         *
+ * @parameters:     none                                         *
+ * @return:         none                                         *
+ * @type:           private                                      *
+ * @purpose:        initialize necessary buffers                 *
+ ****************************************************************/
+
+- (void) priv_initBuffers
+{
+	UInt32 s = kDefaultValue_BufferSize-1;
+	mData = (xSpectrumData*) malloc(sizeof(xSpectrumData) + s*sizeof(Float32));
+	
+	memset (&mData->mFetchStamp, 0, sizeof(AudioTimeStamp));
+	mData->mFetchStamp.mFlags = kAudioTimeStampSampleTimeValid;
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::priv_addListeners        *
+ * @parameters:     none                                         *
+ * @return:         none                                         *
+ * @type:           private                                      *
+ * @purpose:        Add EventListener                            *
+ ****************************************************************/
+
+- (void)priv_addListeners 
+{
+	if (mAU) 
+	{
+		verify_noerr(AUEventListenerCreate(EventListenerDispatcher, 
+											self,
+											CFRunLoopGetCurrent(), 
+											kCFRunLoopDefaultMode, 
+											0.05, 
+											0.05, 
+											&mAUEventListener));
+	}
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::priv_removeListeners     *
+ * @parameters:     none                                         *
+ * @return:         none                                         *
+ * @type:           private                                      *
+ * @purpose:        remove all EventListeners                    *
+ ****************************************************************/
+
+- (void)priv_removeListeners 
+{
+	if(mAUEventListener) verify_noerr (AUListenerDispose(mAUEventListener));
+	mAUEventListener = NULL;
+	mAU = NULL;
+}
+
+- (void)priv_synchronizeUIWithParameterValues {}
+
+#pragma mark ____ LISTENER CALLBACK DISPATCHEE ____
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::priv_parameterListener   *
+ * @parameters:     const AudioUnitParameter*, Float32           *
+ * @return:         none                                         *
+ * @type:           private                                      *
+ * @purpose:        adds custom AU parameter Listener            *
+ ****************************************************************/
+
+- (void)priv_parameterListener:(void *)inObject parameter:(const AudioUnitParameter *)inParameter value:(Float32)inValue 
+{
+    //the inObject parameter is ignored in this case.
+    switch (inParameter->mParameterID) {}
+}
+
+
+
+/*****************************************************************
+ * @author:         Rohan Jyoti                                  *
+ * @name:           xSpectrumCocoaView::priv_eventListener       *
+ * @parameters:     void*, const AudioUnitEvent*                 *
+ * @return:         none                                         *
+ * @type:           private                                      *
+ * @purpose:        Handle kAudioUnitProperty_PresentPreset      *
+ *                  event                                        *
+ ****************************************************************/
+ 
+- (void)priv_eventListener:(void *) inObject event:(const AudioUnitEvent *)inEvent value:(Float32)inValue 
+{
+	switch (inEvent->mEventType) 
+	{
+		case kAudioUnitEvent_ParameterValueChange: // Account for any parameter changes
+			switch (inEvent->mArgument.mParameter.mParameterID) {}
+			// get the data from the audio unit
+			[self updateSpectrum: nil];
+			break;
+			
+		case kAudioUnitEvent_PropertyChange: // Account for any custom property changes
+			if(inEvent->mArgument.mProperty.mPropertyID == kAudioUnitProperty_xSpectrumData)
+				[self updateSpectrum: nil];
+			break;
+	}
+}
+
+@end

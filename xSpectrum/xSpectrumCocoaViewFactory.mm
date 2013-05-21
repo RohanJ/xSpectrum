@@ -1,0 +1,76 @@
+//
+//  xSpectrumCocoaViewFactory.mm
+//  xSpectrum
+//
+//  Created by Rohan Jyoti on 04/20/13.
+//  Copyright (c) 2013 Rohan Jyoti. All rights reserved.
+//
+
+#import "xSpectrumCocoaViewFactory.h"
+#import "xSpectrumCocoaView.h"
+
+@implementation xSpectrumCocoaViewFactory
+
+/**********************************************************
+ * @author:         Rohan Jyoti                           *
+ * @name:           xSpectrumCocoaView::interfaceVersion  *
+ * @parameters:     none                                  *
+ * @return:         unsigned                              *
+ * @type:           public                                *
+ * @purpose:        returns interface version             *
+ *********************************************************/
+
+- (unsigned)interfaceVersion
+{
+	return 1;
+}
+
+
+
+/**********************************************************
+ * @author:         Rohan Jyoti                           *
+ * @name:           xSpectrumCocoaView::description       *
+ * @parameters:     none                                  *
+ * @return:         NSString*                             *
+ * @type:           public                                *
+ * @purpose:        string description of the Cocoa UI    *
+ *********************************************************/
+
+- (NSString *)description
+{
+	return @"xSpectrum Cocoa View";
+}
+
+
+
+/************************************************************
+ * @author:         Rohan Jyoti                             *
+ * @name:           xSpectrumCocoaView::uiViewForAudioUnit  *
+ * @parameters:     AudioUnit, NSSize                       *
+ * @return:         NSView*                                 *
+ * @type:           public                                  *
+ * @purpose:        this class is simply a view-factory,    *
+ *                  returning a new autoreleased view each  *
+ *                  time it's called.                       *
+ ***********************************************************/
+
+- (NSView *)uiViewForAudioUnit:(AudioUnit)inAU withSize:(NSSize)inPreferredSize
+{
+	if (![NSBundle loadNibNamed: @"xSpectrumCocoaView" owner:self]) 
+	{
+        NSLog (@"Unable to load nib for view.");
+		return nil;
+	}
+    
+    // This particular nib has a fixed size, so we don't do anything with the inPreferredSize argument.
+    // It's up to the host application to handle.
+    [uiFreshlyLoadedView setAU:inAU];
+    
+    NSView *returnView = uiFreshlyLoadedView;
+    uiFreshlyLoadedView = nil;	// zero out pointer.  This is a view factory.  Once a view's been created
+                                // and handed off, the factory keeps no record of it.
+    
+    return [returnView autorelease];
+}
+
+@end

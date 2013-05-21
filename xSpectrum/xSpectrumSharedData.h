@@ -1,0 +1,41 @@
+//
+//  xSpectrumSharedData.h
+//  xSpectrum
+//
+//  Created by Rohan Jyoti on 04/20/13.
+//  Copyright (c) 2013 Rohan Jyoti. All rights reserved.
+//
+
+#ifndef xSpectrum_xSpectrumSharedData_h
+#define xSpectrum_xSpectrumSharedData_h
+
+#if !defined(__COREAUDIO_USE_FLAT_INCLUDES__)
+	#include <CoreAudio/CoreAudioTypes.h>
+#else
+	#include <CoreAudioTypes.h>
+#endif
+
+#define kMaxNumAnalysisFrames	512
+#define kMaxNumBins				512
+#define kMaxSonogramLatency		512
+
+typedef SInt64 SampleTime;
+
+#pragma mark __xSpectrumCocaView DataStructs
+
+struct xSpectrumData
+{
+	//Components written by view
+	UInt32 mChannel;
+	UInt32 mNumSlices;
+	AudioTimeStamp mFetchStamp; //time stamp for data processing
+	
+	//Components written by model
+	UInt32 mNumBins;
+	Float32 mMaxAmp;
+	Float32 mMinAmp;
+	Float32 mData[1];
+};
+typedef struct xSpectrumData xSpectrumData;
+
+#endif

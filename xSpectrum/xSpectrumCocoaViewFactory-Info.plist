@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>xSpectrumCocoaViewFactory</string>
+	<key>CFBundleIdentifier</key>
+	<string>audioX.${PRODUCT_NAME:rfc1034identifier}.CocoaViewFactory</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>NSMainNibFile</key>
+	<string>xSpectrumCocoaView</string>
+	<key>NSPrincipalClass</key>
+	<string>xSpectrumCocoaViewFactory</string>
+</dict>
+</plist>

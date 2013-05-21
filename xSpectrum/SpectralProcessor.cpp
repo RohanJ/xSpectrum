@@ -1,0 +1,348 @@
+//
+//  SpectralProcessor.cpp
+//  xSpectrum2
+//
+//  Created by Rohan Jyoti on 04/20/13.
+//  Copyright 2013 Rohan Jyoti. All rights reserved.
+//
+
+/* This file heavily follows the theory/mathematics from the following book: 
+		The Audio Programming Book by Richard Boulanger and Victor Lazzarini                                                   
+		MLA Citation: (Boulanger, Richard), (Lazzarini, Victor). The Audio Programming Book. Cambridge, MA: The MIT Press, 2011. Print.
+ 
+	CoreAudio APIs and notes from Apple Developers were also used as reference. 
+ 
+	ProcessForward --> time-domain to frequency-domain (real to complex)
+	ProcessBckward --> frequency-domain to time-domain (complex to real)
+	For DSP purposes --> ProcessForward + SetSpectralFunction + ProcessBackward --> Send to Audio Out.
+ */
+
+
+//#include "AudioFormulas.h"
+#include "SpectralProcessor.h"
+#include "CABitOperations.h"
+
+
+#include <Accelerate/Accelerate.h>
+
+
+#define OFFSETOF(class, field)((size_t)&((class*)0)->field)
+
+SpectralProcessor::SpectralProcessor(UInt32 inFFTSize, UInt32 inHopSize, UInt32 inNumChannels, UInt32 inMaxFrames)
+	: mFFTSize(inFFTSize), mHopSize(inHopSize), mNumChannels(inNumChannels), mMaxFrames(inMaxFrames),
+	mLog2FFTSize(Log2Ceil(mFFTSize)), 
+	mFFTMask(mFFTSize - 1),
+	mFFTByteSize(mFFTSize * sizeof(Float32)),
+	mIOBufSize(NextPowerOfTwo(mFFTSize + mMaxFrames)),
+	mIOMask(mIOBufSize - 1),
+	mInputSize(0),
+	mInputPos(0), mOutputPos(-mFFTSize & mIOMask), 
+	mInFFTPos(0), mOutFFTPos(0),
+	mSpectralFunction(0), mUserData(0)
+{
+	mWindow.alloc(mFFTSize, false);
+	SineWindow(); // set default window.
+	
+	mChannels.alloc(mNumChannels);
+	mSpectralBufferList.allocBytes(OFFSETOF(SpectralBufferList, mDSPSplitComplex[mNumChannels]), true);
+	mSpectralBufferList->mNumberSpectra = mNumChannels;
+	for (UInt32 i = 0; i < mNumChannels; ++i) 
+	{
+		mChannels[i].mInputBuf.alloc(mIOBufSize, true);
+		mChannels[i].mOutputBuf.alloc(mIOBufSize, true);
+		mChannels[i].mFFTBuf.alloc(mFFTSize, true);
+		mChannels[i].mSplitFFTBuf.alloc(mFFTSize, true);
+		mSpectralBufferList->mDSPSplitComplex[i].realp = mChannels[i].mSplitFFTBuf();
+		mSpectralBufferList->mDSPSplitComplex[i].imagp = mChannels[i].mSplitFFTBuf() + (mFFTSize >> 1);
+	}
+
+	mFFTSetup = vDSP_create_fftsetup (mLog2FFTSize, FFT_RADIX2);
+	
+}
+
+SpectralProcessor::~SpectralProcessor()
+{
+	mWindow.free();
+	mChannels.free();
+	mSpectralBufferList.free();
+	vDSP_destroy_fftsetup(mFFTSetup);
+}
+
+void SpectralProcessor::Reset()
+{
+	mInputPos = 0;
+	mOutputPos = -mFFTSize & mIOMask;
+	mInFFTPos = 0;
+	mOutFFTPos = 0;
+	
+	for (UInt32 i = 0; i < mNumChannels; ++i) 
+	{
+		memset(mChannels[i].mInputBuf(), 0, mIOBufSize * sizeof(Float32));
+		memset(mChannels[i].mOutputBuf(), 0, mIOBufSize * sizeof(Float32));
+		memset(mChannels[i].mFFTBuf(), 0, mFFTSize * sizeof(Float32));
+	}
+}
+
+const double two_pi = 2. * M_PI;
+
+void SpectralProcessor::HanningWindow()
+{ 
+	double w = two_pi / (double)(mFFTSize - 1);
+	for (UInt32 i = 0; i < mFFTSize; ++i)
+	{
+		mWindow[i] = (0.5 - 0.5 * cos(w * (double)i));	
+	}
+}
+
+void SpectralProcessor::SineWindow()
+{
+	double w = M_PI / (double)(mFFTSize - 1);
+	for (UInt32 i = 0; i < mFFTSize; ++i)
+	{
+		mWindow[i] = sin(w * (double)i);
+	}
+}
+
+void SpectralProcessor::Process(UInt32 inNumFrames, AudioBufferList* inInput, AudioBufferList* outOutput)
+{
+	CopyInput(inNumFrames, inInput);
+	
+	while (mInputSize >= mFFTSize) 
+	{
+		CopyInputToFFT();
+		DoWindowing();
+		DoFwdFFT();
+		ProcessSpectrum(mFFTSize, mSpectralBufferList());
+		DoInvFFT();
+		DoWindowing();
+		OverlapAddOutput();
+	}
+	CopyOutput(inNumFrames, outOutput);
+}
+
+void SpectralProcessor::DoWindowing()
+{
+	Float32 *win = mWindow();
+	if (!win) return;
+	for (UInt32 i=0; i<mNumChannels; ++i) 
+	{
+		Float32 *x = mChannels[i].mFFTBuf();
+		vDSP_vmul(x, 1, win, 1, x, 1, mFFTSize);
+	}
+}
+
+
+
+void SpectralProcessor::CopyInput(UInt32 inNumFrames, AudioBufferList* inInput)
+{
+	UInt32 numBytes = inNumFrames * sizeof(Float32);
+	UInt32 firstPart = mIOBufSize - mInputPos;
+	
+
+	if (firstPart < inNumFrames) 
+	{
+		UInt32 firstPartBytes = firstPart * sizeof(Float32);
+		UInt32 secondPartBytes = numBytes - firstPartBytes;
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{		
+			memcpy(mChannels[i].mInputBuf + mInputPos, inInput->mBuffers[i].mData, firstPartBytes);
+			memcpy(mChannels[i].mInputBuf, (UInt8*)inInput->mBuffers[i].mData + firstPartBytes, secondPartBytes);
+		}
+	} 
+	else 
+	{
+		UInt32 numBytes = inNumFrames * sizeof(Float32);
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{		
+			memcpy(mChannels[i].mInputBuf + mInputPos, inInput->mBuffers[i].mData, numBytes);
+		}
+	}
+	mInputSize += inNumFrames;
+	mInputPos = (mInputPos + inNumFrames) & mIOMask;
+}
+
+void SpectralProcessor::CopyOutput(UInt32 inNumFrames, AudioBufferList* outOutput)
+{
+	UInt32 numBytes = inNumFrames * sizeof(Float32);
+	UInt32 firstPart = mIOBufSize - mOutputPos;
+	if (firstPart < inNumFrames) 
+	{
+		UInt32 firstPartBytes = firstPart * sizeof(Float32);
+		UInt32 secondPartBytes = numBytes - firstPartBytes;
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{
+			memcpy(outOutput->mBuffers[i].mData, mChannels[i].mOutputBuf + mOutputPos, firstPartBytes);
+			memcpy((UInt8*)outOutput->mBuffers[i].mData + firstPartBytes, mChannels[i].mOutputBuf, secondPartBytes);
+			memset(mChannels[i].mOutputBuf + mOutputPos, 0, firstPartBytes);
+			memset(mChannels[i].mOutputBuf, 0, secondPartBytes);
+		}
+	} 
+	else 
+	{
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{
+			memcpy(outOutput->mBuffers[i].mData, mChannels[i].mOutputBuf + mOutputPos, numBytes);
+			memset(mChannels[i].mOutputBuf + mOutputPos, 0, numBytes);
+		}
+	}
+	mOutputPos = (mOutputPos + inNumFrames) & mIOMask;
+}
+
+void SpectralProcessor::PrintSpectralBufferList()
+{
+	UInt32 half = mFFTSize >> 1;
+	for (UInt32 i=0; i<mNumChannels; ++i) 
+	{
+		DSPSplitComplex	&freqData = mSpectralBufferList->mDSPSplitComplex[i];
+	
+		for (UInt32 j=0; j<half; j++)
+		{
+			printf(" bin[%d]: %lf + %lfi\n", (int) j, freqData.realp[j], freqData.imagp[j]);
+		}
+	}
+}
+
+
+void SpectralProcessor::CopyInputToFFT()
+{
+	UInt32 firstPart = mIOBufSize - mInFFTPos;
+	UInt32 firstPartBytes = firstPart * sizeof(Float32);
+	if (firstPartBytes < mFFTByteSize) 
+	{
+		UInt32 secondPartBytes = mFFTByteSize - firstPartBytes;
+		for (UInt32 i=0; i<mNumChannels; ++i) {
+			memcpy(mChannels[i].mFFTBuf(), mChannels[i].mInputBuf() + mInFFTPos, firstPartBytes);
+			memcpy((UInt8*)mChannels[i].mFFTBuf() + firstPartBytes, mChannels[i].mInputBuf(), secondPartBytes);
+		}
+	} 
+	else 
+	{
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{
+			memcpy(mChannels[i].mFFTBuf(), mChannels[i].mInputBuf() + mInFFTPos, mFFTByteSize);
+		}
+	}
+	mInputSize -= mHopSize;
+	mInFFTPos = (mInFFTPos + mHopSize) & mIOMask;
+}
+
+void SpectralProcessor::OverlapAddOutput()
+{
+	UInt32 firstPart = mIOBufSize - mOutFFTPos;
+	if (firstPart < mFFTSize) {
+		UInt32 secondPart = mFFTSize - firstPart;
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{
+			float* out1 = mChannels[i].mOutputBuf() + mOutFFTPos;
+			vDSP_vadd(out1, 1, mChannels[i].mFFTBuf(), 1, out1, 1, firstPart);
+			float* out2 = mChannels[i].mOutputBuf();
+			vDSP_vadd(out2, 1, mChannels[i].mFFTBuf() + firstPart, 1, out2, 1, secondPart);
+		}
+	} 
+	else 
+	{
+		for (UInt32 i=0; i<mNumChannels; ++i) 
+		{
+			float* out1 = mChannels[i].mOutputBuf() + mOutFFTPos;
+			vDSP_vadd(out1, 1, mChannels[i].mFFTBuf(), 1, out1, 1, mFFTSize);
+		}
+	}
+	mOutFFTPos = (mOutFFTPos + mHopSize) & mIOMask;
+}
+
+
+void SpectralProcessor::DoFwdFFT()
+{
+	UInt32 half = mFFTSize >> 1;
+	for (UInt32 i=0; i<mNumChannels; ++i) 
+	{
+		vDSP_ctoz((DSPComplex*)mChannels[i].mFFTBuf(), 2, &mSpectralBufferList->mDSPSplitComplex[i], 1, half);
+		vDSP_fft_zrip(mFFTSetup, &mSpectralBufferList->mDSPSplitComplex[i], 1, mLog2FFTSize, FFT_FORWARD);
+	}
+}
+
+void SpectralProcessor::DoInvFFT()
+{
+	UInt32 half = mFFTSize >> 1;
+	for (UInt32 i=0; i<mNumChannels; ++i) 
+	{
+		vDSP_fft_zrip(mFFTSetup, &mSpectralBufferList->mDSPSplitComplex[i], 1, mLog2FFTSize, FFT_INVERSE);
+		vDSP_ztoc(&mSpectralBufferList->mDSPSplitComplex[i], 1, (DSPComplex*)mChannels[i].mFFTBuf(), 2, half);		
+		float scale = 0.5 / mFFTSize;
+		vDSP_vsmul(mChannels[i].mFFTBuf(), 1, &scale, mChannels[i].mFFTBuf(), 1, mFFTSize );
+	}
+}
+
+void SpectralProcessor::SetSpectralFunction(SpectralFunction inFunction, void* inUserData)
+{
+	mSpectralFunction = inFunction; 
+	mUserData = inUserData;
+}
+
+void SpectralProcessor::ProcessSpectrum(UInt32 inFFTSize, SpectralBufferList* inSpectra)
+{
+	if (mSpectralFunction)
+		(mSpectralFunction)(inSpectra, mUserData);
+}
+
+#pragma mark ___Utility___
+
+void SpectralProcessor::GetMagnitude(AudioBufferList* list, Float32* min, Float32* max) 
+{	
+	UInt32 half = mFFTSize >> 1;	
+	for (UInt32 i=0; i<mNumChannels; ++i) 
+	{
+		DSPSplitComplex	&freqData = mSpectralBufferList->mDSPSplitComplex[i];		
+		Float32* b = (Float32*) list->mBuffers[i].mData;
+		vDSP_zvabs(&freqData,1,b,1,half); 		
+		vDSP_maxmgv(b, 1, &max[i], half); 
+ 		vDSP_minmgv(b, 1, &min[i], half); 
+	} 
+}
+
+
+void SpectralProcessor::GetFrequencies(Float32* freqs, Float32 sampleRate)
+{
+	UInt32 half = mFFTSize >> 1;	
+
+	for (UInt32 i=0; i< half; i++)
+	{
+		freqs[i] = ((Float32)(i))*sampleRate/((Float32)mFFTSize);	
+	}
+}
+
+
+bool SpectralProcessor::ProcessForwards(UInt32 inNumFrames, AudioBufferList* inInput)
+{
+	// copy from buffer list to input buffer
+	CopyInput(inNumFrames, inInput);
+		
+	bool processed = false;
+	// if enough input to process, then process.
+	while (mInputSize >= mFFTSize) 
+	{
+		CopyInputToFFT(); // copy from input buffer to fft buffer
+		DoWindowing();
+		DoFwdFFT();
+		ProcessSpectrum(mFFTSize, mSpectralBufferList()); // here you would copy the fft results out to a buffer indicated in mUserData, say for sonogram drawing
+		processed = true;
+	}
+	
+	return processed;
+}
+
+bool SpectralProcessor::ProcessBackwards(UInt32 inNumFrames, AudioBufferList* outOutput)
+{		
+	
+	ProcessSpectrum(mFFTSize, mSpectralBufferList());
+	DoInvFFT();
+	DoWindowing();
+	OverlapAddOutput();		
+	
+	// copy from output buffer to buffer list
+	CopyOutput(inNumFrames, outOutput);
+	
+	return true;
+}
+
+
